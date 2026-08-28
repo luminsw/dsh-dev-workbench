@@ -1,0 +1,11 @@
+# dsh-dev-workbench 组合包 patch：为 DSH 注入三语种开发工作台插件行。
+#
+# 安装本包（dsh plugin --profile web add <本目录>）后，profile 组合会自动应用本层。
+# 如需覆盖默认配置，在 ~/.dsh/cordis.patch.yml 里按 id 覆盖 config：
+#   - id: dsh-dev-workbench
+#     config:
+#       projects: { kotlin: 'C:\\Users\\lumin\\src\\kotlin', ... }
+
+- insert:
+    - id: dsh-dev-workbench
+      name: dsh-dev-workbench
