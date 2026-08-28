@@ -17,7 +17,7 @@ import { runQuick, createOpRunner } from "./ops.js";
 
 export const name = "dsh-dev-workbench";
 
-export const inject = ["tools"];
+export const inject = ["tools", "webServer"];
 
 export const Config = z.object({
   /** 各项目根目录；省略时按 ~/src/<name> 自动探测。 */
@@ -87,8 +87,8 @@ const DOTNET_PROJECTS = ["baihua", "mdyjCloud"];
 const ARKTS_PROJECTS = ["arkts"];
 const ALL_PROJECTS = [...ANDROID_PROJECTS, ...DOTNET_PROJECTS, ...ARKTS_PROJECTS];
 
-export function apply(ctx) {
-  const cfg = () => ctx.config;
+export function apply(ctx, config) {
+  const cfg = () => config;
   const paths = () => probePaths(cfg());
   const ops = createOpRunner();
 
@@ -97,8 +97,14 @@ export function apply(ctx) {
     const p = paths();
     if (project === "kotlin") {
       const gradlew = join(p.projects.kotlin, "gradlew.bat");
-      const task =
-        target === "install" ? ":app:installDebug" : target === "test" ? ":app:testDebugUnitTest" : ":app:assembleDebug";
+      // sub 非空时作为完整 gradle 任务（如 :baihua-sdk:assembleRelease / :app:lintDebug），
+      // 覆盖 SDK 模块单独构建；缺省按 target 用 :app 主任务。
+      let task;
+      if (sub) {
+        task = String(sub);
+      } else {
+        task = target === "install" ? ":app:installDebug" : target === "test" ? ":app:testDebugUnitTest" : ":app:assembleDebug";
+      }
       return {
         command: gradlew,
         args: [task],
@@ -127,6 +133,58 @@ export function apply(ctx) {
         cwd: root,
         env: { ...process.env },
         label: `dotnet ${verb}${sub ? ` ${sub}` : ""}`,
+      };
+    }
+    return null;
+  }
+
+  // 按项目构造「CI 等效完整验证」命令：
+  //  - kotlin：单测 + androidTest 编译（AGENTS.md 要求两段都过）
+  //  - arkts：scripts\verify-local.ps1（ohpm install → 单测+lint → assembleApp → 可选安装）
+  //  - baihua：dotnet test 三个测试项目（Family / Sdk / Huapu）
+  //  - mdyjCloud：dotnet test（无统一 sln，sub 可指定测试子路径）
+  function verifyCommand(project, install, sub) {
+    const p = paths();
+    if (project === "kotlin") {
+      return {
+        command: join(p.projects.kotlin, "gradlew.bat"),
+        args: [":app:testDebugUnitTest", ":app:assembleDebugAndroidTest"],
+        cwd: p.projects.kotlin,
+        env: { ...process.env, JAVA_HOME: p.javaHome },
+        label: "kotlin 完整验证（单测+androidTest 编译）",
+      };
+    }
+    if (project === "arkts") {
+      const ps = join(p.projects.arkts, "scripts", "verify-local.ps1");
+      const args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps];
+      if (install) args.push("-install");
+      return {
+        command: "powershell",
+        args,
+        cwd: p.projects.arkts,
+        env: { ...process.env },
+        label: `arkts verify-local${install ? " +install" : ""}`,
+      };
+    }
+    if (project === "baihua") {
+      const tests = ["tests\\Baihua.Family.Tests", "tests\\Baihua.Sdk.Tests", "tests\\Huapu.Tests"];
+      const cmd = tests.map((t) => `dotnet test "${t}"`).join(" && ");
+      return {
+        command: "cmd",
+        args: ["/d", "/s", "/c", cmd],
+        cwd: p.projects.baihua,
+        env: { ...process.env },
+        label: "baihua 全部测试（3 项目）",
+      };
+    }
+    if (project === "mdyjCloud") {
+      const args = sub ? ["test", String(sub)] : ["test"];
+      return {
+        command: "dotnet",
+        args,
+        cwd: p.projects.mdyjCloud,
+        env: { ...process.env },
+        label: `dotnet test${sub ? ` ${sub}` : ""}`,
       };
     }
     return null;
@@ -244,10 +302,10 @@ export function apply(ctx) {
     name: "dev_build",
     target: "build",
     description:
-      "构建指定项目（宿主机操作，耗时数分钟，后台执行，返回 opId 后用 dev_build_status 查询）：kotlin→gradlew :app:assembleDebug（自动 JAVA_HOME=JDK21）；baihua/mdyjCloud→dotnet build（仓库无 sln 时需在 sub 指定子路径，如 services/Baihua.Family 或 libs/MobileContract）；arkts→DevEco hvigorw assembleApp。执行前请先向用户确认。",
+      "构建指定项目（宿主机操作，耗时数分钟，后台执行，返回 opId 后用 dev_build_status 查询）：kotlin→gradlew :app:assembleDebug（自动 JAVA_HOME=JDK21，sub 可传完整 gradle 任务如 :baihua-sdk:assembleRelease 或 :app:lintDebug 以构建 SDK 模块/跑其它任务）；baihua/mdyjCloud→dotnet build（仓库无 sln 时需在 sub 指定子路径，如 services/Baihua.Family 或 libs/MobileContract）；arkts→DevEco hvigorw assembleApp。执行前请先向用户确认。",
     parameters: {
       project: { type: "string", enum: ALL_PROJECTS, required: true, description: "kotlin / baihua / mdyjCloud / arkts" },
-      sub: { type: "string", description: "（baihua/mdyjCloud 用）子路径，如 services/Baihua.Family" },
+      sub: { type: "string", description: "kotlin：完整 gradle 任务（如 :baihua-sdk:assembleRelease）；baihua/mdyjCloud：子路径（如 services/Baihua.Family）" },
     },
   });
 
@@ -255,12 +313,36 @@ export function apply(ctx) {
     name: "dev_test",
     target: "test",
     description:
-      "运行指定项目测试（宿主机操作，后台执行）：kotlin→gradlew :app:testDebugUnitTest；baihua/mdyjCloud→dotnet test（sub 指定子路径）；arkts 暂不支持命令行测试（用 DevEco）。执行前请先向用户确认。",
+      "运行指定项目测试（宿主机操作，后台执行）：kotlin→gradlew :app:testDebugUnitTest（JVM 单测；完整验证含 androidTest 用 dev_verify）；baihua/mdyjCloud→dotnet test（sub 指定子路径）；arkts 测试在 dev_verify（verify-local.ps1）。执行前请先向用户确认。",
     parameters: {
       project: { type: "string", enum: ALL_PROJECTS, required: true, description: "kotlin / baihua / mdyjCloud / arkts" },
       sub: { type: "string", description: "（baihua/mdyjCloud 用）子路径，如 tests/MobileGateway.Tests" },
     },
   });
+
+  ctx.tools.register(
+    defineTool({
+      name: "dev_verify",
+      description:
+        "按项目跑 CI 等效完整验证（宿主机操作，后台执行，返回 opId 后用 dev_build_status 查询）：kotlin→gradlew :app:testDebugUnitTest + :app:assembleDebugAndroidTest（AGENTS.md 要求两段都过才算全绿）；arkts→scripts\\verify-local.ps1（ohpm install→单测+lint→assembleApp，install=true 时装真机含签名冲突自动卸载重装）；baihua→dotnet test 三个测试项目（Family/Sdk/Huapu）；mdyjCloud→dotnet test（sub 可指定测试子路径）。执行前请先向用户确认。",
+      parameters: {
+        project: { type: "string", enum: ALL_PROJECTS, required: true, description: "kotlin / baihua / mdyjCloud / arkts" },
+        install: { type: "boolean", description: "（arkts 用）验证后是否安装到真机（verify-local -install）" },
+        sub: { type: "string", description: "（mdyjCloud 用）测试子路径，如 tests/MobileGateway.Tests" },
+      },
+      output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
+      async execute(args) {
+        const project = String(args.project);
+        if (!ALL_PROJECTS.includes(project)) {
+          return `未知项目 ${project}，可选：${ALL_PROJECTS.join(" / ")}`;
+        }
+        const cmd = verifyCommand(project, args.install === true, args.sub ? String(args.sub) : "");
+        if (!cmd) return `项目 ${project} 不支持 dev_verify`;
+        const opId = ops.start(cmd.label, cmd.command, cmd.args, { cwd: cmd.cwd, env: cmd.env });
+        return `已开始${cmd.label}（opId=${opId}，项目 ${project}）。用 dev_build_status 查询进度。`;
+      },
+    }),
+  );
 
   ctx.tools.register(
     defineTool({
