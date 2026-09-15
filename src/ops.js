@@ -15,13 +15,20 @@ export const QUICK_TIMEOUT_MS = 60000;
 
 /**
  * 平台正确的 (command, args)：
- * - win32 且命令为 .cmd/.bat → cmd.exe /d /s /c "<cmd> <args...>"
+ * - win32 且命令为 .cmd/.bat → cmd.exe /d /c <cmd> <args...>
  * - 其余 → 原样
+ *
+ * 注意两个曾经踩过的坑（都会让构建工具"秒失败"）：
+ * 1) 不要把 command+args 手工拼成一个大字符串再交给 cmd —— cmd 会把
+ *    "C:\path\x.bat" 连同引号当成可执行文件名，报
+ *    `'"C:\path\x.bat"' 不是内部或外部命令`。
+ * 2) 不要加 /s —— /s 会剥掉整串命令行的首尾引号，带空格的路径会被截断成
+ *    `C:\...\with` 而找不到。
+ * 正确姿势：分开传 argv，由 Node 负责给含空格的参数加引号，用 cmd /d /c。
  */
 export function wrapCommand(command, args = []) {
   if (process.platform === "win32" && /\.(cmd|bat)$/i.test(command)) {
-    const quoted = [command, ...args].map((a) => `"${a}"`).join(" ");
-    return ["cmd", ["/d", "/s", "/c", quoted]];
+    return ["cmd", ["/d", "/c", command, ...args]];
   }
   return [command, args];
 }
