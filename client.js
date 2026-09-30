@@ -43,7 +43,11 @@ window.__ModuleLoader__.load({
       sectionTitle: { fontSize: 12, fontWeight: 600, opacity: 0.8, margin: "8px 0 4px" },
     };
 
-    function DevWorkbenchCard() {
+    function DevWorkbenchCard(props) {
+      // summary 只用于行描述兜底（bundle 配置页只渲染 page）
+      if (props.view === "summary") {
+        return React.createElement("span", null, "三语种（C#/Kotlin/ArkTS）构建、设备与后台操作状态");
+      }
       const [data, setData] = useState(null);
       const [err, setErr] = useState(null);
       const [msg, setMsg] = useState(null); // { ok, text }
@@ -147,12 +151,13 @@ window.__ModuleLoader__.load({
       name: "dsh-dev-workbench-client",
       inject: ["slots"],
       apply(ctx) {
-        ctx.slots.inject("settings.plugin.item", function* () {
+        // DSH 0.2.x：卡片挂在「插件」页里本 bundle 自己的页面上
+        // （plugins.bundle.config，key = 包名）；旧版 settings.plugin.item 槽位已删除。
+        ctx.slots.inject("plugins.bundle.config", function* () {
           yield ctx.slots.register(
             {
-              name: "settings.plugin.item",
-              key: "devWorkbench",
-              locale: "settings.devWorkbench",
+              name: "plugins.bundle.config",
+              key: "dsh-dev-workbench",
             },
             DevWorkbenchCard,
           );
