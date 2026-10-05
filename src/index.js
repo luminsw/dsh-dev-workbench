@@ -13,7 +13,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import z from "@deepseek-ai/schemastery";
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import { runQuick, createOpRunner } from "./ops.js";
+import { runAsync, createOpRunner } from "./ops.js";
 
 export const name = "dsh-dev-workbench";
 
@@ -191,8 +191,8 @@ export function apply(ctx, config) {
   }
 
   // ---------- 设备与日志 ----------
-  function adbDevices(p) {
-    const r = runQuick(p.adb, ["devices"], { timeoutMs: 10000 });
+  async function adbDevices(p) {
+    const r = await runAsync(p.adb, ["devices"], { timeoutMs: 10000 });
     if (!r.ok) return { ok: false, error: r.error || r.stderr || `adb devices 失败（status ${r.status}）` };
     const lines = r.stdout.split(/\r?\n/).filter(Boolean);
     const devices = lines
@@ -203,11 +203,66 @@ export function apply(ctx, config) {
     return { ok: true, devices };
   }
 
-  function hdcDevices(p) {
-    const r = runQuick(p.hdc, ["list", "targets"], { timeoutMs: 10000 });
+  async function hdcDevices(p) {
+    const r = await runAsync(p.hdc, ["list", "targets"], { timeoutMs: 10000 });
     if (!r.ok) return { ok: false, error: r.error || r.stderr || `hdc list targets 失败（status ${r.status}）` };
     const lines = r.stdout.split(/\r?\n/).filter((l) => l.trim());
     return { ok: true, devices: lines.map((l) => ({ serial: l.trim() })) };
+  }
+
+  /**
+   * 设备列表缓存（2s TTL + stale-while-revalidate）。
+   *
+   * adb/hdc 冷启动要 1-3s（adb server 首次拉起），状态卡片每开一次都重跑就是每次等 3s；
+   * 有缓存后稳态是毫秒级，且刷新在后台继续，卡片不会长时间转圈。
+   */
+  const DEVICES_TTL_MS = 2000;
+  const DEVICES_UI_MAX_WAIT_MS = 1200;
+  const DEVICES_TIMEOUT = Symbol("devices-timeout");
+  let devicesCache = { at: 0, android: null, harmony: null, inflight: null };
+
+  function refreshDevices() {
+    if (devicesCache.inflight) return devicesCache.inflight;
+    const p = paths();
+    devicesCache.inflight = Promise.all([adbDevices(p), hdcDevices(p)])
+      .then(([android, harmony]) => {
+        devicesCache = { at: Date.now(), android, harmony, inflight: null };
+        return devicesCache;
+      })
+      .catch((error) => {
+        devicesCache.inflight = null;
+        return {
+          ...devicesCache,
+          android: devicesCache.android ?? { ok: false, error: String(error?.message ?? error) },
+          harmony: devicesCache.harmony ?? { ok: false, error: String(error?.message ?? error) },
+        };
+      });
+    return devicesCache.inflight;
+  }
+
+  /**
+   * 设备快照。waitMs 未给（工具路径）→ 等刷新完成；给了（卡片路径）→ 最多等这么久，
+   * 超时先返回旧值 / 「探测中」占位，刷新在后台继续。
+   */
+  async function devicesSnapshot(opts = {}) {
+    if (devicesCache.at && Date.now() - devicesCache.at < DEVICES_TTL_MS) return devicesCache;
+    const pending = refreshDevices();
+    const { waitMs } = opts;
+    if (!Number.isFinite(waitMs) || waitMs <= 0) return pending;
+    let timerId;
+    const timer = new Promise((resolve) => {
+      timerId = setTimeout(() => resolve(DEVICES_TIMEOUT), waitMs);
+      timerId.unref?.();
+    });
+    try {
+      const r = await Promise.race([pending, timer]);
+      if (r !== DEVICES_TIMEOUT) return r;
+      if (devicesCache.at) return devicesCache;
+      const probe = "设备探测中（首次需拉起 adb/hdc，约 1-3s；后台继续，稍后刷新即可）";
+      return { at: 0, android: { ok: false, error: probe }, harmony: { ok: false, error: probe } };
+    } finally {
+      clearTimeout(timerId);
+    }
   }
 
   // ---------- 工具注册 ----------
@@ -220,12 +275,13 @@ export function apply(ctx, config) {
       output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
       async execute() {
         const p = paths();
+        const snap = await devicesSnapshot();
+        const a = snap.android ?? { ok: false, error: "adb 探测未返回" };
+        const h = snap.harmony ?? { ok: false, error: "hdc 探测未返回" };
         const lines = ["=== Android (adb) ==="];
-        const a = adbDevices(p);
         if (a.ok) lines.push(...(a.devices.length ? a.devices.map((d) => `  ${d.serial}  ${d.state}`) : ["  （无设备）"]));
         else lines.push(`  ❌ ${a.error}`);
         lines.push("", "=== HarmonyOS (hdc) ===");
-        const h = hdcDevices(p);
         if (h.ok) lines.push(...(h.devices.length ? h.devices.map((d) => `  ${d.serial}`) : ["  （无设备）"]));
         else lines.push(`  ❌ ${h.error}`);
         return lines.join("\n");
@@ -244,7 +300,7 @@ export function apply(ctx, config) {
       output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
       async execute(args) {
         const p = paths();
-        const r = runQuick(p.adb, ["connect", String(args.address)], { timeoutMs: 20000 });
+        const r = await runAsync(p.adb, ["connect", String(args.address)], { timeoutMs: 20000 });
         return r.ok ? `✅ ${r.stdout.trim() || "已连接"}` : `❌ 连接失败：${r.error || r.stderr || r.stdout}`;
       },
     }),
@@ -266,11 +322,11 @@ export function apply(ctx, config) {
         const n = Number(args.lines) || 200;
         if (args.platform === "android") {
           const filter = args.filter ? [String(args.filter)] : [];
-          const r = runQuick(p.adb, ["logcat", "-d", "-t", String(n), ...filter], { timeoutMs: 20000 });
+          const r = await runAsync(p.adb, ["logcat", "-d", "-t", String(n), ...filter], { timeoutMs: 20000 });
           return r.ok ? (r.stdout || "(空)") : `❌ ${r.error || r.stderr || "logcat 失败"}`;
         }
         const filterArgs = args.filter ? ["-x", String(args.filter)] : [];
-        const r = runQuick(p.hdc, ["hilog", "-z", String(n), ...filterArgs], { timeoutMs: 20000 });
+        const r = await runAsync(p.hdc, ["hilog", "-z", String(n), ...filterArgs], { timeoutMs: 20000 });
         return r.ok ? (r.stdout || "(空)") : `❌ ${r.error || r.stderr || "hilog 失败"}`;
       },
     }),
@@ -393,19 +449,26 @@ export function apply(ctx, config) {
       const dispose = webServer.register({
         kind: "exact",
         path: "/dsh-dev-workbench/status",
-        handler: (_req, res) => {
-          const p = paths();
-          const a = adbDevices(p);
-          const h = hdcDevices(p);
-          json(res, 200, {
-            ok: true,
-            devices: {
-              android: a.ok ? a.devices : [{ error: a.error }],
-              harmony: h.ok ? h.devices : [{ error: h.error }],
-            },
-            ops: ops.list(),
-            projects: p.projects,
-          });
+        handler: async (_req, res) => {
+          try {
+            // 设备列表走 2s TTL 缓存 + 最多等 1.2s（首次要拉起 adb server，约 1-3s）；
+            // 超时先给旧值/「探测中」占位，刷新在后台继续 —— 不再同步阻塞整个 harness。
+            const snap = await devicesSnapshot({ waitMs: DEVICES_UI_MAX_WAIT_MS });
+            const p = paths();
+            const a = snap.android ?? { ok: false, error: "adb 探测未返回" };
+            const h = snap.harmony ?? { ok: false, error: "hdc 探测未返回" };
+            json(res, 200, {
+              ok: true,
+              devices: {
+                android: a.ok ? a.devices : [{ error: a.error }],
+                harmony: h.ok ? h.devices : [{ error: h.error }],
+              },
+              ops: ops.list(),
+              projects: p.projects,
+            });
+          } catch (error) {
+            json(res, 500, { ok: false, error: String(error?.message ?? error) });
+          }
         },
       });
       return dispose;

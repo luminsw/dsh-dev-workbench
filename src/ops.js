@@ -1,12 +1,13 @@
 /**
  * dsh-dev-workbench — 命令执行封装。
  *
- * - 快速命令（devices/connect/logcat 单次）：spawnSync + 超时，同步返回。
+ * - 快速命令（devices/connect/logcat 单次）：**异步 spawn + 超时**（绝不 spawnSync —— DSH 单线程，
+ *   同步调用会把整个 harness 冻住；实测 `adb devices` 冷启动 1-3s）。
  * - 长操作（build/test/install）：后台 spawn，输出落盘 + 内存 tail，返回 opId。
  * - Windows 兼容：.cmd/.bat 统一经 cmd.exe /d /s /c 包装（Node 无法直接 spawn
  *   .bat：bare 名 ENOENT、.cmd EINVAL）；.exe 直接 spawn。
  */
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -33,24 +34,57 @@ export function wrapCommand(command, args = []) {
   return [command, args];
 }
 
-/** 同步执行一次命令，超时截断，返回 { ok, status, stdout, stderr, error }。 */
-export function runQuick(command, args = [], { cwd, env, timeoutMs = QUICK_TIMEOUT_MS } = {}) {
-  try {
-    const r = spawnSync(command, args, {
-      cwd,
-      env,
-      encoding: "utf8",
-      timeout: timeoutMs,
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
+/**
+ * 异步执行一次命令，超时 kill，返回 { ok, status, stdout, stderr, error }。
+ *
+ * ⚠️ 不要改回 spawnSync：DSH 是单线程 Node 进程，同步执行子命令会把整个 harness
+ * （Web UI、SSE、流式输出）冻住。实测本机 `adb devices` 冷启动要 1-3s（adb server 首次拉起），
+ * 同步版就是整站卡 3.5s（dev-workbench 状态卡片曾因此实测 3.54s 全站冻结）。
+ */
+export function runAsync(command, args = [], { cwd, env, timeoutMs = QUICK_TIMEOUT_MS } = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => {
+      if (settled) return;
+      settled = true;
+      resolve(v);
+    };
+    let child;
+    try {
+      child = spawn(command, args, {
+        cwd,
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+    } catch (e) {
+      return done({ ok: false, status: null, stdout: "", stderr: "", error: String(e?.message ?? e) });
+    }
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        /* noop */
+      }
+      done({ ok: false, status: null, stdout, stderr, error: `超时（${timeoutMs}ms）` });
+    }, timeoutMs);
+    child.stdout?.on("data", (d) => {
+      stdout += d.toString();
     });
-    const stdout = (r.stdout || "").toString();
-    const stderr = (r.stderr || "").toString();
-    if (r.error) return { ok: false, status: null, stdout, stderr, error: r.error.message };
-    return { ok: r.status === 0, status: r.status, stdout, stderr, error: null };
-  } catch (e) {
-    return { ok: false, status: null, stdout: "", stderr: "", error: e.message };
-  }
+    child.stderr?.on("data", (d) => {
+      stderr += d.toString();
+    });
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      done({ ok: false, status: null, stdout, stderr, error: String(e?.message ?? e) });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      done({ ok: code === 0, status: code ?? null, stdout, stderr, error: null });
+    });
+  });
 }
 
 /** 后台长操作管理器：spawn + 落盘 + tail + opId。 */
